@@ -20,7 +20,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import anthropic
 import openai
-import httpx
 
 from config import (
     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
@@ -40,17 +39,16 @@ dp = Dispatcher(storage=MemoryStorage())
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# ── Хранилище активных писем (в памяти) ──────────────────────
-# email_id -> {from, subject, body, reply_to, folder}
+# ── Хранилище активных писем ──────────────────────────────────
 pending_emails: dict[str, dict] = {}
 
 # ── FSM состояния ─────────────────────────────────────────────
 class MailFlow(StatesGroup):
-    waiting_context   = State()   # ждём голосовой/текст с контекстом
-    waiting_own_reply = State()   # ждём свой вариант ответа
-    confirm_send      = State()   # подтверждение отправки
+    waiting_context   = State()
+    waiting_own_reply = State()
+    confirm_send      = State()
 
-# ── Системный промпт агента ───────────────────────────────────
+# ── Системный промпт ───────────────────────────────────────────
 SYSTEM_PROMPT = """Ты — ассистент Исполнителя по подготовке ответов в рабочей переписке с Заказчиком.
 Твоя задача — помогать формировать ответы, которые:
   - сохраняют деловые и партнёрские отношения;
@@ -63,7 +61,7 @@ SYSTEM_PROMPT = """Ты — ассистент Исполнителя по по�
   - при наличии — выдержки из договора, ТЗ, приложений.
 
 Что ты должен сделать:
-  1. Кратко объяснить, что реально просит Заказчик (1–2 предложения).
+  1. Кратко объяснить, что реально просит Заказчик (1-2 предложения).
   2. Выявить риски для Исполнителя: деньги, сроки, объём, качество, ответственность.
   3. Определить, входит ли запрос в текущий объём договора или это допработы.
   4. Предложить рекомендованную позицию Исполнителя.
@@ -77,7 +75,7 @@ SYSTEM_PROMPT = """Ты — ассистент Исполнителя по по�
   - пиши кратко, вежливо, уверенно и по делу;
   - если данных недостаточно — задай уточняющие вопросы.
 
-ВАЖНО: Ответ верни строго в формате JSON (без markdown-блоков, без преамбулы):
+ВАЖНО: Ответ верни строго в формате JSON (без markdown, без преамбулы):
 {
   "summary": "Суть запроса",
   "risks": "Риски для Исполнителя",
@@ -88,9 +86,18 @@ SYSTEM_PROMPT = """Ты — ассистент Исполнителя по по�
   "variant_3": "Жёсткий вариант ответа"
 }"""
 
+
 # ══════════════════════════════════════════════════════════════
-#  IMAP — мониторинг почты
+#  Вспомогательные функции
 # ══════════════════════════════════════════════════════════════
+
+def encode_folder(folder: str) -> str:
+    """Кодирует название папки в IMAP4 UTF-7 для русских символов."""
+    try:
+        return folder.encode('imap4-utf-7').decode('ascii')
+    except Exception:
+        return folder
+
 
 def decode_str(value: str) -> str:
     parts = decode_header(value)
@@ -122,20 +129,25 @@ def sender_allowed(from_field: str) -> bool:
     return any(domain in from_lower for domain in ALLOWED_DOMAINS)
 
 
+# ══════════════════════════════════════════════════════════════
+#  IMAP — мониторинг почты
+# ══════════════════════════════════════════════════════════════
+
 async def check_mail():
-    """Периодически проверяет почту и отправляет новые письма в ТГ."""
     seen_ids: set[str] = set()
 
     while True:
         try:
             imap = imaplib.IMAP4_SSL("imap.yandex.ru")
             imap.login(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
+            log.info("IMAP подключение успешно")
 
             for folder in MONITORED_FOLDERS:
                 try:
-                    status, _ = imap.select(f'"{folder}"')
+                    encoded_folder = encode_folder(folder)
+                    status, _ = imap.select(f'"{encoded_folder}"')
                     if status != "OK":
-                        log.warning(f"Папка не найдена: {folder}")
+                        log.warning(f"Папка не найдена: {folder} (encoded: {encoded_folder})")
                         continue
 
                     _, data = imap.search(None, "UNSEEN")
@@ -160,7 +172,7 @@ async def check_mail():
 
                         subject = decode_str(msg.get("Subject", "(без темы)"))
                         reply_to = msg.get("Reply-To") or msg.get("From", "")
-                        body = get_body(msg)[:3000]  # ограничиваем длину
+                        body = get_body(msg)[:3000]
 
                         email_key = global_id
                         pending_emails[email_key] = {
@@ -185,7 +197,6 @@ async def check_mail():
 
 
 async def notify_user(email_key: str):
-    """Отправляет уведомление о новом письме в Telegram."""
     em = pending_emails[email_key]
     text = (
         f"📩 <b>Новое письмо</b>\n"
@@ -208,11 +219,8 @@ async def notify_user(email_key: str):
         reply_markup=kb
     )
 
-    # Сохраняем ключ письма в FSM через send_message не получится,
-    # поэтому храним в глобальном состоянии ожидания
     pending_emails[email_key]["notified"] = True
 
-    # Устанавливаем состояние FSM для чата
     state = dp.fsm.resolve_context(bot, TELEGRAM_CHAT_ID, TELEGRAM_CHAT_ID)
     await state.set_state(MailFlow.waiting_context)
     await state.update_data(current_email_key=email_key)
@@ -240,28 +248,24 @@ async def skip_email(call: CallbackQuery, state: FSMContext):
 
 @dp.message(MailFlow.waiting_context, F.voice)
 async def handle_voice_context(message: Message, state: FSMContext):
-    """Принимаем голосовое, транскрибируем через Whisper."""
     data = await state.get_data()
     email_key = data.get("current_email_key")
 
     if not email_key or email_key not in pending_emails:
-        await message.answer("⚠️ Письмо не найдено. Возможно, оно уже обработано.")
+        await message.answer("⚠️ Письмо не найдено. Возможно, уже обработано.")
         await state.clear()
         return
 
     await message.answer("🎙 Распознаю голос...")
 
-    # Скачиваем голосовой файл
     voice = message.voice
     file = await bot.get_file(voice.file_id)
-    file_path = file.file_path
 
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         tmp_path = tmp.name
 
-    await bot.download_file(file_path, tmp_path)
+    await bot.download_file(file.file_path, tmp_path)
 
-    # Транскрибируем
     with open(tmp_path, "rb") as audio_file:
         transcript = openai_client.audio.transcriptions.create(
             model="whisper-1",
@@ -272,13 +276,11 @@ async def handle_voice_context(message: Message, state: FSMContext):
 
     context_text = transcript.text
     await message.answer(f"📝 Распознано: <i>{context_text}</i>", parse_mode="HTML")
-
     await generate_and_show_variants(message, state, email_key, context_text)
 
 
 @dp.message(MailFlow.waiting_context, F.text)
 async def handle_text_context(message: Message, state: FSMContext):
-    """Принимаем текстовый контекст."""
     data = await state.get_data()
     email_key = data.get("current_email_key")
 
@@ -291,7 +293,6 @@ async def handle_text_context(message: Message, state: FSMContext):
 
 
 async def generate_and_show_variants(message: Message, state: FSMContext, email_key: str, context: str):
-    """Отправляем в Claude и показываем варианты ответа."""
     em = pending_emails[email_key]
     await message.answer("⏳ Анализирую письмо, генерирую варианты...")
 
@@ -312,12 +313,10 @@ async def generate_and_show_variants(message: Message, state: FSMContext, email_
     try:
         result = json.loads(raw)
     except json.JSONDecodeError:
-        # Если вдруг Claude обернул в ```json
         import re
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         result = json.loads(match.group()) if match else {}
 
-    # Сохраняем варианты в state
     await state.update_data(
         email_key=email_key,
         variant_1=result.get("variant_1", ""),
@@ -325,7 +324,6 @@ async def generate_and_show_variants(message: Message, state: FSMContext, email_
         variant_3=result.get("variant_3", ""),
     )
 
-    # Формируем сообщение с анализом
     analysis = (
         f"🔍 <b>Суть:</b> {result.get('summary', '—')}\n\n"
         f"⚠️ <b>Риски:</b> {result.get('risks', '—')}\n\n"
@@ -334,24 +332,23 @@ async def generate_and_show_variants(message: Message, state: FSMContext, email_
     )
     await message.answer(analysis, parse_mode="HTML")
 
-    # Показываем варианты
-    v1 = result.get("variant_1", "")[:200]
-    v2 = result.get("variant_2", "")[:200]
-    v3 = result.get("variant_3", "")[:200]
+    v1 = result.get("variant_1", "")[:300]
+    v2 = result.get("variant_2", "")[:300]
+    v3 = result.get("variant_3", "")[:300]
 
     variants_text = (
         f"✉️ <b>Варианты ответа:</b>\n\n"
-        f"<b>1️⃣ Мягкий:</b>\n{v1}...\n\n"
-        f"<b>2️⃣ Нейтральный:</b>\n{v2}...\n\n"
-        f"<b>3️⃣ Жёсткий:</b>\n{v3}..."
+        f"<b>1️⃣ Мягкий:</b>\n{v1}\n\n"
+        f"<b>2️⃣ Нейтральный:</b>\n{v2}\n\n"
+        f"<b>3️⃣ Жёсткий:</b>\n{v3}"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1️⃣ Мягкий",     callback_data="send_variant:1")],
-        [InlineKeyboardButton(text="2️⃣ Нейтральный", callback_data="send_variant:2")],
-        [InlineKeyboardButton(text="3️⃣ Жёсткий",     callback_data="send_variant:3")],
-        [InlineKeyboardButton(text="✏️ Свой вариант", callback_data="send_variant:own")],
-        [InlineKeyboardButton(text="❌ Отмена",        callback_data="send_variant:cancel")],
+        [InlineKeyboardButton(text="1️⃣ Мягкий",      callback_data="send_variant:1")],
+        [InlineKeyboardButton(text="2️⃣ Нейтральный",  callback_data="send_variant:2")],
+        [InlineKeyboardButton(text="3️⃣ Жёсткий",      callback_data="send_variant:3")],
+        [InlineKeyboardButton(text="✏️ Свой вариант",  callback_data="send_variant:own")],
+        [InlineKeyboardButton(text="❌ Отмена",         callback_data="send_variant:cancel")],
     ])
 
     await message.answer(variants_text, parse_mode="HTML", reply_markup=kb)
@@ -375,21 +372,17 @@ async def choose_variant(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
-    # Вариант 1/2/3
     variant_text = data.get(f"variant_{choice}", "")
     await state.update_data(selected_reply=variant_text)
     await state.set_state(MailFlow.confirm_send)
 
     await call.message.answer(
-        f"📤 <b>Будет отправлено:</b>\n\n{variant_text}\n\n"
-        f"Подтвердить отправку?",
+        f"📤 <b>Будет отправлено:</b>\n\n{variant_text}\n\nПодтвердить отправку?",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Отправить", callback_data="confirm:yes"),
-                InlineKeyboardButton(text="🔙 Назад",     callback_data="confirm:no"),
-            ]
-        ])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Отправить", callback_data="confirm:yes"),
+            InlineKeyboardButton(text="🔙 Назад",     callback_data="confirm:no"),
+        ]])
     )
     await call.answer()
 
@@ -402,12 +395,10 @@ async def handle_own_reply(message: Message, state: FSMContext):
     await message.answer(
         f"📤 <b>Будет отправлено:</b>\n\n{message.text}\n\nПодтвердить?",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Отправить", callback_data="confirm:yes"),
-                InlineKeyboardButton(text="🔙 Назад",     callback_data="confirm:no"),
-            ]
-        ])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Отправить", callback_data="confirm:yes"),
+            InlineKeyboardButton(text="🔙 Назад",     callback_data="confirm:no"),
+        ]])
     )
 
 
@@ -417,9 +408,8 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
     if choice == "no":
-        # Возвращаем к выбору варианта
         await state.set_state(MailFlow.waiting_context)
-        await call.message.answer("🔙 Выберите действие заново или отправьте новый контекст.")
+        await call.message.answer("🔙 Отправьте новый контекст или выберите вариант заново.")
         await call.answer()
         return
 

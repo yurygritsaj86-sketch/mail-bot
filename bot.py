@@ -29,6 +29,9 @@ from config import (
     IMAP_CHECK_INTERVAL
 )
 
+MAILERSEND_USER = os.getenv("MAILERSEND_USER", "")
+MAILERSEND_PASS = os.getenv("MAILERSEND_PASS", "")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -451,10 +454,10 @@ def send_email(to: str, subject: str, body: str) -> bool:
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        with smtplib.SMTP("smtp.yandex.ru", 587) as server:
+        with smtplib.SMTP("smtp.mailersend.net", 587) as server:
             server.ehlo()
             server.starttls()
-            server.login(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
+            server.login(MAILERSEND_USER, MAILERSEND_PASS)
             server.sendmail(YANDEX_EMAIL, to, msg.as_string())
 
         log.info(f"Письмо отправлено: {to} / {subject}")

@@ -451,14 +451,16 @@ def send_email(to: str, subject: str, body: str) -> bool:
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        with smtplib.SMTP_SSL("smtp.yandex.ru", 465) as server:
+        with smtplib.SMTP("smtp.yandex.ru", 587) as server:
+            server.ehlo()
+            server.starttls()
             server.login(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
             server.sendmail(YANDEX_EMAIL, to, msg.as_string())
 
         log.info(f"Письмо отправлено: {to} / {subject}")
         return True
     except Exception as e:
-        log.error(f"SMTP ошибка: {e}")
+        log.error(f"SMTP error: {e}")
         return False
 
 

@@ -1,0 +1,480 @@
+import asyncio
+import logging
+import imaplib
+import email
+import smtplib
+import os
+import json
+import tempfile
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.header import decode_header
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
+import anthropic
+import openai
+import httpx
+
+from config import (
+    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+    YANDEX_EMAIL, YANDEX_APP_PASSWORD,
+    ANTHROPIC_API_KEY, OPENAI_API_KEY,
+    ALLOWED_DOMAINS, MONITORED_FOLDERS,
+    IMAP_CHECK_INTERVAL
+)
+
+# ── Логирование ──────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+# ── Клиенты API ──────────────────────────────────────────────
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+# ── Хранилище активных писем (в памяти) ──────────────────────
+# email_id -> {from, subject, body, reply_to, folder}
+pending_emails: dict[str, dict] = {}
+
+# ── FSM состояния ─────────────────────────────────────────────
+class MailFlow(StatesGroup):
+    waiting_context   = State()   # ждём голосовой/текст с контекстом
+    waiting_own_reply = State()   # ждём свой вариант ответа
+    confirm_send      = State()   # подтверждение отправки
+
+# ── Системный промпт агента ───────────────────────────────────
+SYSTEM_PROMPT = """Ты — ассистент Исполнителя по подготовке ответов в рабочей переписке с Заказчиком.
+Твоя задача — помогать формировать ответы, которые:
+  - сохраняют деловые и партнёрские отношения;
+  - защищают интересы Исполнителя;
+  - не допускают незафиксированных обязательств по объёму, срокам, стоимости и ответственности.
+
+На вход ты получаешь:
+  - текст письма или сообщения Заказчика/Директоров/Кураторов;
+  - контекст ситуации от Исполнителя (голосовой или текстовый);
+  - при наличии — выдержки из договора, ТЗ, приложений.
+
+Что ты должен сделать:
+  1. Кратко объяснить, что реально просит Заказчик (1–2 предложения).
+  2. Выявить риски для Исполнителя: деньги, сроки, объём, качество, ответственность.
+  3. Определить, входит ли запрос в текущий объём договора или это допработы.
+  4. Предложить рекомендованную позицию Исполнителя.
+  5. Подготовить 3 варианта готового ответа: мягкий / нейтральный / жёсткий.
+  6. Указать, что нужно зафиксировать письменно.
+
+Правила:
+  - не подтверждай новые обязательства без оговорок;
+  - не соглашайся на допобъём без фиксации стоимости и сроков;
+  - не допускай формулировок, ухудшающих позицию Исполнителя;
+  - пиши кратко, вежливо, уверенно и по делу;
+  - если данных недостаточно — задай уточняющие вопросы.
+
+ВАЖНО: Ответ верни строго в формате JSON (без markdown-блоков, без преамбулы):
+{
+  "summary": "Суть запроса",
+  "risks": "Риски для Исполнителя",
+  "position": "Рекомендованная позиция",
+  "fix_in_writing": "Что зафиксировать письменно",
+  "variant_1": "Мягкий вариант ответа",
+  "variant_2": "Нейтральный вариант ответа",
+  "variant_3": "Жёсткий вариант ответа"
+}"""
+
+# ══════════════════════════════════════════════════════════════
+#  IMAP — мониторинг почты
+# ══════════════════════════════════════════════════════════════
+
+def decode_str(value: str) -> str:
+    parts = decode_header(value)
+    result = ""
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            result += part.decode(enc or "utf-8", errors="replace")
+        else:
+            result += part
+    return result
+
+
+def get_body(msg) -> str:
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            cd = str(part.get("Content-Disposition", ""))
+            if ct == "text/plain" and "attachment" not in cd:
+                charset = part.get_content_charset() or "utf-8"
+                return part.get_payload(decode=True).decode(charset, errors="replace")
+    else:
+        charset = msg.get_content_charset() or "utf-8"
+        return msg.get_payload(decode=True).decode(charset, errors="replace")
+    return ""
+
+
+def sender_allowed(from_field: str) -> bool:
+    from_lower = from_field.lower()
+    return any(domain in from_lower for domain in ALLOWED_DOMAINS)
+
+
+async def check_mail():
+    """Периодически проверяет почту и отправляет новые письма в ТГ."""
+    seen_ids: set[str] = set()
+
+    while True:
+        try:
+            imap = imaplib.IMAP4_SSL("imap.yandex.ru")
+            imap.login(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
+
+            for folder in MONITORED_FOLDERS:
+                try:
+                    status, _ = imap.select(f'"{folder}"')
+                    if status != "OK":
+                        log.warning(f"Папка не найдена: {folder}")
+                        continue
+
+                    _, data = imap.search(None, "UNSEEN")
+                    if not data[0]:
+                        continue
+
+                    for uid in data[0].split():
+                        uid_str = uid.decode()
+                        global_id = f"{folder}:{uid_str}"
+
+                        if global_id in seen_ids:
+                            continue
+                        seen_ids.add(global_id)
+
+                        _, msg_data = imap.fetch(uid, "(RFC822)")
+                        raw = msg_data[0][1]
+                        msg = email.message_from_bytes(raw)
+
+                        from_field = decode_str(msg.get("From", ""))
+                        if not sender_allowed(from_field):
+                            continue
+
+                        subject = decode_str(msg.get("Subject", "(без темы)"))
+                        reply_to = msg.get("Reply-To") or msg.get("From", "")
+                        body = get_body(msg)[:3000]  # ограничиваем длину
+
+                        email_key = global_id
+                        pending_emails[email_key] = {
+                            "from": from_field,
+                            "subject": subject,
+                            "body": body,
+                            "reply_to": reply_to,
+                            "folder": folder,
+                        }
+
+                        await notify_user(email_key)
+
+                except Exception as e:
+                    log.error(f"Ошибка папки {folder}: {e}")
+
+            imap.logout()
+
+        except Exception as e:
+            log.error(f"IMAP ошибка: {e}")
+
+        await asyncio.sleep(IMAP_CHECK_INTERVAL)
+
+
+async def notify_user(email_key: str):
+    """Отправляет уведомление о новом письме в Telegram."""
+    em = pending_emails[email_key]
+    text = (
+        f"📩 <b>Новое письмо</b>\n"
+        f"📁 Папка: <i>{em['folder']}</i>\n"
+        f"👤 От: <code>{em['from']}</code>\n"
+        f"📌 Тема: <b>{em['subject']}</b>\n\n"
+        f"<pre>{em['body'][:1500]}</pre>\n\n"
+        f"✏️ <b>Добавь контекст</b> — напиши или надиктуй голосом, "
+        f"что хочешь ответить и какую позицию занять."
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Пропустить", callback_data=f"skip:{email_key}")
+    ]])
+
+    await bot.send_message(
+        TELEGRAM_CHAT_ID,
+        text,
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+    # Сохраняем ключ письма в FSM через send_message не получится,
+    # поэтому храним в глобальном состоянии ожидания
+    pending_emails[email_key]["notified"] = True
+
+    # Устанавливаем состояние FSM для чата
+    state = dp.fsm.resolve_context(bot, TELEGRAM_CHAT_ID, TELEGRAM_CHAT_ID)
+    await state.set_state(MailFlow.waiting_context)
+    await state.update_data(current_email_key=email_key)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Обработчики Telegram
+# ══════════════════════════════════════════════════════════════
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer(
+        "👋 Почтовый ассистент запущен.\n"
+        "Жду новых писем с разрешённых адресов."
+    )
+
+
+@dp.callback_query(F.data.startswith("skip:"))
+async def skip_email(call: CallbackQuery, state: FSMContext):
+    email_key = call.data.split("skip:")[1]
+    pending_emails.pop(email_key, None)
+    await state.clear()
+    await call.message.edit_text("⏭ Письмо пропущено.")
+
+
+@dp.message(MailFlow.waiting_context, F.voice)
+async def handle_voice_context(message: Message, state: FSMContext):
+    """Принимаем голосовое, транскрибируем через Whisper."""
+    data = await state.get_data()
+    email_key = data.get("current_email_key")
+
+    if not email_key or email_key not in pending_emails:
+        await message.answer("⚠️ Письмо не найдено. Возможно, оно уже обработано.")
+        await state.clear()
+        return
+
+    await message.answer("🎙 Распознаю голос...")
+
+    # Скачиваем голосовой файл
+    voice = message.voice
+    file = await bot.get_file(voice.file_id)
+    file_path = file.file_path
+
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    await bot.download_file(file_path, tmp_path)
+
+    # Транскрибируем
+    with open(tmp_path, "rb") as audio_file:
+        transcript = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            language="ru"
+        )
+    os.unlink(tmp_path)
+
+    context_text = transcript.text
+    await message.answer(f"📝 Распознано: <i>{context_text}</i>", parse_mode="HTML")
+
+    await generate_and_show_variants(message, state, email_key, context_text)
+
+
+@dp.message(MailFlow.waiting_context, F.text)
+async def handle_text_context(message: Message, state: FSMContext):
+    """Принимаем текстовый контекст."""
+    data = await state.get_data()
+    email_key = data.get("current_email_key")
+
+    if not email_key or email_key not in pending_emails:
+        await message.answer("⚠️ Письмо не найдено.")
+        await state.clear()
+        return
+
+    await generate_and_show_variants(message, state, email_key, message.text)
+
+
+async def generate_and_show_variants(message: Message, state: FSMContext, email_key: str, context: str):
+    """Отправляем в Claude и показываем варианты ответа."""
+    em = pending_emails[email_key]
+    await message.answer("⏳ Анализирую письмо, генерирую варианты...")
+
+    user_prompt = (
+        f"ПИСЬМО:\nОт: {em['from']}\nТема: {em['subject']}\n\n{em['body']}\n\n"
+        f"КОНТЕКСТ ОТ ИСПОЛНИТЕЛЯ:\n{context}"
+    )
+
+    response = anthropic_client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2000,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}]
+    )
+
+    raw = response.content[0].text.strip()
+
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        # Если вдруг Claude обернул в ```json
+        import re
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        result = json.loads(match.group()) if match else {}
+
+    # Сохраняем варианты в state
+    await state.update_data(
+        email_key=email_key,
+        variant_1=result.get("variant_1", ""),
+        variant_2=result.get("variant_2", ""),
+        variant_3=result.get("variant_3", ""),
+    )
+
+    # Формируем сообщение с анализом
+    analysis = (
+        f"🔍 <b>Суть:</b> {result.get('summary', '—')}\n\n"
+        f"⚠️ <b>Риски:</b> {result.get('risks', '—')}\n\n"
+        f"📌 <b>Позиция:</b> {result.get('position', '—')}\n\n"
+        f"📋 <b>Зафиксировать:</b> {result.get('fix_in_writing', '—')}"
+    )
+    await message.answer(analysis, parse_mode="HTML")
+
+    # Показываем варианты
+    v1 = result.get("variant_1", "")[:200]
+    v2 = result.get("variant_2", "")[:200]
+    v3 = result.get("variant_3", "")[:200]
+
+    variants_text = (
+        f"✉️ <b>Варианты ответа:</b>\n\n"
+        f"<b>1️⃣ Мягкий:</b>\n{v1}...\n\n"
+        f"<b>2️⃣ Нейтральный:</b>\n{v2}...\n\n"
+        f"<b>3️⃣ Жёсткий:</b>\n{v3}..."
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1️⃣ Мягкий",     callback_data="send_variant:1")],
+        [InlineKeyboardButton(text="2️⃣ Нейтральный", callback_data="send_variant:2")],
+        [InlineKeyboardButton(text="3️⃣ Жёсткий",     callback_data="send_variant:3")],
+        [InlineKeyboardButton(text="✏️ Свой вариант", callback_data="send_variant:own")],
+        [InlineKeyboardButton(text="❌ Отмена",        callback_data="send_variant:cancel")],
+    ])
+
+    await message.answer(variants_text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("send_variant:"))
+async def choose_variant(call: CallbackQuery, state: FSMContext):
+    choice = call.data.split("send_variant:")[1]
+    data = await state.get_data()
+
+    if choice == "cancel":
+        email_key = data.get("email_key")
+        pending_emails.pop(email_key, None)
+        await state.clear()
+        await call.message.edit_text("❌ Отменено.")
+        return
+
+    if choice == "own":
+        await call.message.answer("✏️ Напишите ваш вариант ответа:")
+        await state.set_state(MailFlow.waiting_own_reply)
+        await call.answer()
+        return
+
+    # Вариант 1/2/3
+    variant_text = data.get(f"variant_{choice}", "")
+    await state.update_data(selected_reply=variant_text)
+    await state.set_state(MailFlow.confirm_send)
+
+    await call.message.answer(
+        f"📤 <b>Будет отправлено:</b>\n\n{variant_text}\n\n"
+        f"Подтвердить отправку?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Отправить", callback_data="confirm:yes"),
+                InlineKeyboardButton(text="🔙 Назад",     callback_data="confirm:no"),
+            ]
+        ])
+    )
+    await call.answer()
+
+
+@dp.message(MailFlow.waiting_own_reply, F.text)
+async def handle_own_reply(message: Message, state: FSMContext):
+    await state.update_data(selected_reply=message.text)
+    await state.set_state(MailFlow.confirm_send)
+
+    await message.answer(
+        f"📤 <b>Будет отправлено:</b>\n\n{message.text}\n\nПодтвердить?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Отправить", callback_data="confirm:yes"),
+                InlineKeyboardButton(text="🔙 Назад",     callback_data="confirm:no"),
+            ]
+        ])
+    )
+
+
+@dp.callback_query(F.data.startswith("confirm:"))
+async def confirm_send(call: CallbackQuery, state: FSMContext):
+    choice = call.data.split("confirm:")[1]
+    data = await state.get_data()
+
+    if choice == "no":
+        # Возвращаем к выбору варианта
+        await state.set_state(MailFlow.waiting_context)
+        await call.message.answer("🔙 Выберите действие заново или отправьте новый контекст.")
+        await call.answer()
+        return
+
+    email_key = data.get("email_key")
+    reply_text = data.get("selected_reply", "")
+    em = pending_emails.get(email_key, {})
+
+    success = send_email(
+        to=em.get("reply_to", ""),
+        subject=f"Re: {em.get('subject', '')}",
+        body=reply_text,
+    )
+
+    if success:
+        await call.message.edit_text("✅ Письмо отправлено!")
+        pending_emails.pop(email_key, None)
+        await state.clear()
+    else:
+        await call.message.answer("❌ Ошибка отправки. Проверьте настройки SMTP.")
+
+    await call.answer()
+
+
+# ══════════════════════════════════════════════════════════════
+#  SMTP — отправка письма
+# ══════════════════════════════════════════════════════════════
+
+def send_email(to: str, subject: str, body: str) -> bool:
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = YANDEX_EMAIL
+        msg["To"] = to
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        with smtplib.SMTP_SSL("smtp.yandex.ru", 465) as server:
+            server.login(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
+            server.sendmail(YANDEX_EMAIL, to, msg.as_string())
+
+        log.info(f"Письмо отправлено: {to} / {subject}")
+        return True
+    except Exception as e:
+        log.error(f"SMTP ошибка: {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════
+#  Запуск
+# ══════════════════════════════════════════════════════════════
+
+async def main():
+    log.info("Бот запускается...")
+    asyncio.create_task(check_mail())
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

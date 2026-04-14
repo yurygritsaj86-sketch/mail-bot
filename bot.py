@@ -45,41 +45,85 @@ class MailFlow(StatesGroup):
     waiting_own_reply = State()
     confirm_send      = State()
 
-SYSTEM_PROMPT = """Ты — ассистент Исполнителя по подготовке ответов в рабочей переписке с Заказчиком.
-Твоя задача — помогать формировать ответы, которые:
-  - сохраняют деловые и партнёрские отношения;
-  - защищают интересы Исполнителя;
-  - не допускают незафиксированных обязательств по объёму, срокам, стоимости и ответственности.
+SYSTEM_PROMPT = """Ты — персональный ассистент Грицай Юрия Александровича, руководителя проекта и заместителя директора по корпоративному питанию компании «Партнеры Красноярск».
 
-На вход ты получаешь:
-  - текст письма или сообщения Заказчика/Директоров/Кураторов;
-  - контекст ситуации от Исполнителя (голосовой или текстовый);
-  - при наличии — выдержки из договора, ТЗ, приложений.
+Твоя задача — помогать Юрию составлять ответы на рабочие письма. Ответы должны звучать как живая человеческая речь — без канцелярита, без шаблонных фраз, без признаков ИИ. Всегда обращайся к адресату по имени-отчеству. Если в переписке несколько человек — используй «коллеги».
 
-Что ты должен сделать:
-  1. Кратко объяснить, что реально просит Заказчик (1-2 предложения).
-  2. Выявить риски для Исполнителя: деньги, сроки, объём, качество, ответственность.
-  3. Определить, входит ли запрос в текущий объём договора или это допработы.
-  4. Предложить рекомендованную позицию Исполнителя.
-  5. Подготовить 3 варианта готового ответа: мягкий / нейтральный / жёсткий.
-  6. Указать, что нужно зафиксировать письменно.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ОПРЕДЕЛЕНИЕ РОЛИ ОТПРАВИТЕЛЯ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Правила:
-  - не подтверждай новые обязательства без оговорок;
-  - не соглашайся на допобъём без фиксации стоимости и сроков;
-  - не допускай формулировок, ухудшающих позицию Исполнителя;
-  - пиши кратко, вежливо, уверенно и по делу;
-  - если данных недостаточно — задай уточняющие вопросы.
+1. ЗАКАЗЧИК — если email содержит домен @polymetal.ru, @areal.ru или @p-krsk.ru НЕ входит в список своих, либо отправитель явно представляет заказчика в тексте письма.
 
-ВАЖНО: Ответ верни строго в формате JSON (без markdown, без преамбулы):
+2. ДИРЕКТОР (выше по иерархии) — если отправитель один из:
+   - Устинова Ирина Александровна
+   - Катцина Ирина
+   - Тиунов Ярослав Алексеевич
+   - Матвеев Иван Владимирович
+   - Погодаева Виктория Олеговна
+   - Коваленко Анастасия
+   - Шиятая Светлана Юрьевна
+   - Мерц Софья
+
+3. РАВНЫЙ КОЛЛЕГА — коллега с @p-krsk.ru не входящий в список директоров и не являющийся подчинённым Юрия.
+
+4. ПОДЧИНЁННЫЙ — сотрудник которым Юрий руководит напрямую на своих проектах.
+
+Если роль неочевидна — определяй по контексту письма: тон, должность в подписи, характер просьбы.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+СТИЛЬ ОТВЕТА ПО РОЛЯМ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ЗАКАЗЧИК:
+- Деловой, уверенный, партнёрский тон
+- Защищай интересы Исполнителя — не допускай незафиксированных обязательств
+- Не соглашайся на доп. объём без фиксации стоимости и сроков
+- Не используй формулировки ухудшающие позицию Исполнителя
+- Вежливо но твёрдо
+
+ДИРЕКТОР (выше по иерархии):
+- Уважительно, кратко, конструктивно
+- Без лишних слов — только суть и позиция
+- Обязательно по имени-отчеству
+- Тон уважительный но не подобострастный
+
+РАВНЫЙ КОЛЛЕГА:
+- Неформально, по делу
+- Можно без официоза, живо
+- Обращение по имени-отчеству
+- Тон дружеский но профессиональный
+
+ПОДЧИНЁННЫЙ:
+- Вызывать уважение и желание работать
+- Тон поддерживающий, доверительный
+- Чёткие указания без давления
+- Обращение по имени-отчеству
+- Мотивирующий финал если уместно
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ОБЩИЕ ПРАВИЛА НАПИСАНИЯ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Никакого канцелярита: не «в соответствии с вышеизложенным», не «прошу принять к сведению»
+- Живые обороты: «посмотрел — вижу такую картину», «давайте разберёмся», «со своей стороны сделаю вот что»
+- Всегда по имени-отчеству в начале письма
+- Письмо должно читаться как написанное живым человеком — никаких маркированных списков в тексте ответа, только живые абзацы
+- Если ситуация требует уточнений — задай их прямо и коротко
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+СТРУКТУРА ТВОЕГО ОТВЕТА
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Верни строго JSON без markdown и преамбулы:
 {
-  "summary": "Суть запроса",
-  "risks": "Риски для Исполнителя",
-  "position": "Рекомендованная позиция",
-  "fix_in_writing": "Что зафиксировать письменно",
-  "variant_1": "Мягкий вариант ответа",
-  "variant_2": "Нейтральный вариант ответа",
-  "variant_3": "Жёсткий вариант ответа"
+  "role": "заказчик / директор / равный коллега / подчинённый",
+  "summary": "Суть запроса в 1-2 предложениях",
+  "risks": "Риски для Исполнителя если применимо, иначе пустая строка",
+  "position": "Рекомендованная позиция Юрия",
+  "fix_in_writing": "Что нужно зафиксировать письменно если применимо, иначе пустая строка",
+  "variant_1": "Первый вариант ответа — мягкий или нейтральный тон",
+  "variant_2": "Второй вариант ответа — более прямой или жёсткий тон",
+  "variant_3": "Третий вариант ответа — альтернативная позиция или акцент"
 }"""
 
 
@@ -254,7 +298,6 @@ async def notify_user(email_key: str):
         f"<pre>{body_safe}</pre>"
     )
 
-    # Каждое письмо имеет свои кнопки — ответить именно на это письмо или пропустить
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Ответить на это письмо", callback_data=f"reply:{email_key}")],
         [InlineKeyboardButton(text="❌ Пропустить", callback_data=f"skip:{email_key}")],
@@ -281,7 +324,6 @@ async def cmd_start(message: Message):
 
 @dp.callback_query(F.data.startswith("reply:"))
 async def reply_to_email(call: CallbackQuery, state: FSMContext):
-    """Нажатие кнопки Ответить — привязываем это конкретное письмо к сессии."""
     email_key = call.data.split("reply:")[1]
 
     if email_key not in pending_emails:
@@ -294,7 +336,7 @@ async def reply_to_email(call: CallbackQuery, state: FSMContext):
 
     em = pending_emails[email_key]
     await call.message.answer(
-        f"✏️ Пишу ответ на письмо: <b>{clean_html(em['subject'])}</b>\n\n"
+        f"✏️ Отвечаю на письмо: <b>{clean_html(em['subject'])}</b>\n\n"
         f"Напиши или надиктуй голосом что хочешь ответить и какую позицию занять.",
         parse_mode="HTML"
     )
@@ -306,7 +348,6 @@ async def skip_email(call: CallbackQuery, state: FSMContext):
     email_key = call.data.split("skip:")[1]
     pending_emails.pop(email_key, None)
 
-    # Очищаем FSM только если это письмо было текущим
     data = await state.get_data()
     if data.get("current_email_key") == email_key:
         await state.clear()
@@ -362,12 +403,12 @@ async def generate_and_show_variants(message: Message, state: FSMContext, email_
 
     user_prompt = (
         f"ПИСЬМО:\nОт: {em['from']}\nТема: {em['subject']}\n\n{em['body']}\n\n"
-        f"КОНТЕКСТ ОТ ИСПОЛНИТЕЛЯ:\n{context}"
+        f"КОНТЕКСТ ОТ ЮРИЯ:\n{context}"
     )
 
     response = anthropic_client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=2000,
+        max_tokens=3000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}]
     )
@@ -387,31 +428,42 @@ async def generate_and_show_variants(message: Message, state: FSMContext, email_
         variant_3=result.get("variant_3", ""),
     )
 
-    analysis = (
-        f"🔍 <b>Суть:</b> {clean_html(result.get('summary', '—'))}\n\n"
-        f"⚠️ <b>Риски:</b> {clean_html(result.get('risks', '—'))}\n\n"
-        f"📌 <b>Позиция:</b> {clean_html(result.get('position', '—'))}\n\n"
-        f"📋 <b>Зафиксировать:</b> {clean_html(result.get('fix_in_writing', '—'))}"
-    )
-    await message.answer(analysis, parse_mode="HTML")
+    role = result.get("role", "не определена")
+    role_emoji = {
+        "заказчик": "🏢",
+        "директор": "👔",
+        "равный коллега": "🤝",
+        "подчинённый": "👥",
+    }.get(role, "❓")
 
-    v1 = clean_html(result.get("variant_1", "")[:300])
-    v2 = clean_html(result.get("variant_2", "")[:300])
-    v3 = clean_html(result.get("variant_3", "")[:300])
+    analysis_parts = [f"{role_emoji} <b>Роль:</b> {clean_html(role)}"]
+    analysis_parts.append(f"🔍 <b>Суть:</b> {clean_html(result.get('summary', '—'))}")
+    analysis_parts.append(f"📌 <b>Позиция:</b> {clean_html(result.get('position', '—'))}")
+
+    if result.get("risks"):
+        analysis_parts.append(f"⚠️ <b>Риски:</b> {clean_html(result.get('risks', ''))}")
+    if result.get("fix_in_writing"):
+        analysis_parts.append(f"📋 <b>Зафиксировать:</b> {clean_html(result.get('fix_in_writing', ''))}")
+
+    await message.answer("\n\n".join(analysis_parts), parse_mode="HTML")
+
+    v1 = clean_html(result.get("variant_1", "")[:400])
+    v2 = clean_html(result.get("variant_2", "")[:400])
+    v3 = clean_html(result.get("variant_3", "")[:400])
 
     variants_text = (
         f"✉️ <b>Варианты ответа:</b>\n\n"
-        f"<b>1️⃣ Мягкий:</b>\n{v1}\n\n"
-        f"<b>2️⃣ Нейтральный:</b>\n{v2}\n\n"
-        f"<b>3️⃣ Жёсткий:</b>\n{v3}"
+        f"<b>1️⃣</b>\n{v1}\n\n"
+        f"<b>2️⃣</b>\n{v2}\n\n"
+        f"<b>3️⃣</b>\n{v3}"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1️⃣ Мягкий",      callback_data="send_variant:1")],
-        [InlineKeyboardButton(text="2️⃣ Нейтральный",  callback_data="send_variant:2")],
-        [InlineKeyboardButton(text="3️⃣ Жёсткий",      callback_data="send_variant:3")],
-        [InlineKeyboardButton(text="✏️ Свой вариант",  callback_data="send_variant:own")],
-        [InlineKeyboardButton(text="❌ Отмена",         callback_data="send_variant:cancel")],
+        [InlineKeyboardButton(text="1️⃣ Вариант 1", callback_data="send_variant:1")],
+        [InlineKeyboardButton(text="2️⃣ Вариант 2", callback_data="send_variant:2")],
+        [InlineKeyboardButton(text="3️⃣ Вариант 3", callback_data="send_variant:3")],
+        [InlineKeyboardButton(text="✏️ Свой вариант", callback_data="send_variant:own")],
+        [InlineKeyboardButton(text="❌ Отмена",        callback_data="send_variant:cancel")],
     ])
 
     await message.answer(variants_text, parse_mode="HTML", reply_markup=kb)

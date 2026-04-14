@@ -2,14 +2,11 @@ import asyncio
 import logging
 import imaplib
 import email
-import smtplib
 import os
 import json
 import tempfile
 import re
 import httpx
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
 
 from aiogram import Bot, Dispatcher, F
@@ -129,16 +126,31 @@ def decode_str(value: str) -> str:
 
 
 def get_body(msg) -> str:
+    html_body = ""
     if msg.is_multipart():
         for part in msg.walk():
             ct = part.get_content_type()
             cd = str(part.get("Content-Disposition", ""))
-            if ct == "text/plain" and "attachment" not in cd:
+            if "attachment" in cd:
+                continue
+            if ct == "text/plain":
                 charset = part.get_content_charset() or "utf-8"
                 return part.get_payload(decode=True).decode(charset, errors="replace")
+            elif ct == "text/html" and not html_body:
+                charset = part.get_content_charset() or "utf-8"
+                html_body = part.get_payload(decode=True).decode(charset, errors="replace")
     else:
         charset = msg.get_content_charset() or "utf-8"
-        return msg.get_payload(decode=True).decode(charset, errors="replace")
+        payload = msg.get_payload(decode=True).decode(charset, errors="replace")
+        if msg.get_content_type() == "text/html":
+            html_body = payload
+        else:
+            return payload
+
+    if html_body:
+        html_body = re.sub(r'<[^>]+>', ' ', html_body)
+        html_body = re.sub(r'\s+', ' ', html_body).strip()
+        return html_body
     return ""
 
 
@@ -148,7 +160,6 @@ def sender_allowed(from_field: str) -> bool:
 
 
 def mark_as_read(folder: str, uid: str):
-    """Помечает письмо как прочитанное в IMAP — вызывается только после отправки ответа."""
     try:
         imap = imaplib.IMAP4_SSL("imap.yandex.ru")
         imap.login(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
@@ -192,7 +203,6 @@ async def check_mail():
                         seen_ids.add(global_id)
 
                         _, msg_data = imap.fetch(uid, "(RFC822)")
-                        # Сразу сбрасываем флаг прочитанного — письмо остаётся непрочитанным
                         imap.store(uid, '-FLAGS', '\\Seen')
                         raw = msg_data[0][1]
                         msg = email.message_from_bytes(raw)
@@ -456,7 +466,6 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
 
     if success:
         await call.message.edit_text("✅ Письмо отправлено!")
-        # Помечаем как прочитанное только после успешной отправки ответа
         mark_as_read(em.get("folder", "INBOX"), em.get("uid", ""))
         pending_emails.pop(email_key, None)
         await state.clear()

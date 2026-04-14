@@ -251,14 +251,14 @@ async def notify_user(email_key: str):
         f"📁 Папка: <i>{folder_safe}</i>\n"
         f"👤 От: {from_safe}\n"
         f"📌 Тема: <b>{subject_safe}</b>\n\n"
-        f"<pre>{body_safe}</pre>\n\n"
-        f"✏️ <b>Добавь контекст</b> — напиши или надиктуй голосом, "
-        f"что хочешь ответить и какую позицию занять."
+        f"<pre>{body_safe}</pre>"
     )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="❌ Пропустить", callback_data=f"skip:{email_key}")
-    ]])
+    # Каждое письмо имеет свои кнопки — ответить именно на это письмо или пропустить
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Ответить на это письмо", callback_data=f"reply:{email_key}")],
+        [InlineKeyboardButton(text="❌ Пропустить", callback_data=f"skip:{email_key}")],
+    ])
 
     try:
         await bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML", reply_markup=kb)
@@ -267,17 +267,11 @@ async def notify_user(email_key: str):
         try:
             await bot.send_message(
                 TELEGRAM_CHAT_ID,
-                f"Новое письмо от {em['from']}\nТема: {em['subject']}\n\nНапишите контекст для ответа.",
+                f"Новое письмо от {em['from']}\nТема: {em['subject']}",
                 reply_markup=kb
             )
         except Exception as e2:
             log.error(f"Повторная ошибка Telegram: {e2}")
-            return
-
-    pending_emails[email_key]["notified"] = True
-    state = dp.fsm.resolve_context(bot, TELEGRAM_CHAT_ID, TELEGRAM_CHAT_ID)
-    await state.set_state(MailFlow.waiting_context)
-    await state.update_data(current_email_key=email_key)
 
 
 @dp.message(Command("start"))
@@ -285,12 +279,40 @@ async def cmd_start(message: Message):
     await message.answer("👋 Почтовый ассистент запущен.\nЖду новых писем с разрешённых адресов.")
 
 
+@dp.callback_query(F.data.startswith("reply:"))
+async def reply_to_email(call: CallbackQuery, state: FSMContext):
+    """Нажатие кнопки Ответить — привязываем это конкретное письмо к сессии."""
+    email_key = call.data.split("reply:")[1]
+
+    if email_key not in pending_emails:
+        await call.message.answer("⚠️ Письмо уже обработано или устарело.")
+        await call.answer()
+        return
+
+    await state.set_state(MailFlow.waiting_context)
+    await state.update_data(current_email_key=email_key)
+
+    em = pending_emails[email_key]
+    await call.message.answer(
+        f"✏️ Пишу ответ на письмо: <b>{clean_html(em['subject'])}</b>\n\n"
+        f"Напиши или надиктуй голосом что хочешь ответить и какую позицию занять.",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
 @dp.callback_query(F.data.startswith("skip:"))
 async def skip_email(call: CallbackQuery, state: FSMContext):
     email_key = call.data.split("skip:")[1]
     pending_emails.pop(email_key, None)
-    await state.clear()
+
+    # Очищаем FSM только если это письмо было текущим
+    data = await state.get_data()
+    if data.get("current_email_key") == email_key:
+        await state.clear()
+
     await call.message.edit_text("⏭ Письмо пропущено.")
+    await call.answer()
 
 
 @dp.message(MailFlow.waiting_context, F.voice)
@@ -299,7 +321,7 @@ async def handle_voice_context(message: Message, state: FSMContext):
     email_key = data.get("current_email_key")
 
     if not email_key or email_key not in pending_emails:
-        await message.answer("⚠️ Письмо не найдено. Возможно, уже обработано.")
+        await message.answer("⚠️ Сначала нажми кнопку «Ответить на это письмо».")
         await state.clear()
         return
 
@@ -327,7 +349,7 @@ async def handle_text_context(message: Message, state: FSMContext):
     email_key = data.get("current_email_key")
 
     if not email_key or email_key not in pending_emails:
-        await message.answer("⚠️ Письмо не найдено.")
+        await message.answer("⚠️ Сначала нажми кнопку «Ответить на это письмо».")
         await state.clear()
         return
 
@@ -450,7 +472,7 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
 
     if choice == "no":
         await state.set_state(MailFlow.waiting_context)
-        await call.message.answer("🔙 Отправьте новый контекст или выберите вариант заново.")
+        await call.message.answer("🔙 Нажми «Ответить на это письмо» и отправь новый контекст.")
         await call.answer()
         return
 

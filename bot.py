@@ -148,7 +148,7 @@ def sender_allowed(from_field: str) -> bool:
 
 
 def mark_as_read(folder: str, uid: str):
-    """Помечает письмо как прочитанное в IMAP."""
+    """Помечает письмо как прочитанное в IMAP — вызывается только после отправки ответа."""
     try:
         imap = imaplib.IMAP4_SSL("imap.yandex.ru")
         imap.login(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
@@ -158,7 +158,7 @@ def mark_as_read(folder: str, uid: str):
         imap.logout()
         log.info(f"Письмо {uid} в папке {folder} помечено как прочитанное")
     except Exception as e:
-        log.error(f"Ошибка пометки письма как прочитанного: {e}")
+        log.error(f"Ошибка пометки письма: {e}")
 
 
 async def check_mail():
@@ -192,6 +192,8 @@ async def check_mail():
                         seen_ids.add(global_id)
 
                         _, msg_data = imap.fetch(uid, "(RFC822)")
+                        # Сразу сбрасываем флаг прочитанного — письмо остаётся непрочитанным
+                        imap.store(uid, '-FLAGS', '\\Seen')
                         raw = msg_data[0][1]
                         msg = email.message_from_bytes(raw)
 
@@ -454,7 +456,7 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
 
     if success:
         await call.message.edit_text("✅ Письмо отправлено!")
-        # Помечаем письмо как прочитанное в IMAP
+        # Помечаем как прочитанное только после успешной отправки ответа
         mark_as_read(em.get("folder", "INBOX"), em.get("uid", ""))
         pending_emails.pop(email_key, None)
         await state.clear()

@@ -7,7 +7,6 @@ import os
 import json
 import tempfile
 import re
-import httpx
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
@@ -212,6 +211,30 @@ def mark_as_read(folder: str, uid: str):
         log.info(f"Письмо {uid} в папке {folder} помечено как прочитанное")
     except Exception as e:
         log.error(f"Ошибка пометки письма: {e}")
+
+
+def send_email(to: str, subject: str, body: str) -> bool:
+    try:
+        match = re.search(r'<(.+?)>', to)
+        to_email = match.group(1) if match else to.strip()
+
+        msg = MIMEMultipart()
+        msg["From"] = GMAIL_USER
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(GMAIL_USER, GMAIL_PASSWORD)
+            server.sendmail(GMAIL_USER, to_email, msg.as_string())
+
+        log.info(f"Письмо отправлено через Gmail: {to_email} / {subject}")
+        return True
+    except Exception as e:
+        log.error(f"Gmail SMTP ошибка: {e}")
+        return False
 
 
 async def check_mail():
@@ -529,10 +552,17 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
     reply_text = data.get("selected_reply", "")
     em = pending_emails.get(email_key, {})
 
-    success = send_email(
-        to=em.get("reply_to", ""),
-        subject=f"Re: {em.get('subject', '')}",
-        body=reply_text,
+    # Отвечаем Telegram сразу чтобы не было таймаута
+    await call.answer()
+    await call.message.edit_text("📤 Отправляю письмо...")
+
+    # Отправка в отдельном потоке чтобы не блокировать бота
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(
+        None, send_email,
+        em.get("reply_to", ""),
+        f"Re: {em.get('subject', '')}",
+        reply_text,
     )
 
     if success:
@@ -541,33 +571,7 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
         pending_emails.pop(email_key, None)
         await state.clear()
     else:
-        await call.message.answer("❌ Ошибка отправки.")
-
-    await call.answer()
-
-
-def send_email(to: str, subject: str, body: str) -> bool:
-    try:
-        match = re.search(r'<(.+?)>', to)
-        to_email = match.group(1) if match else to.strip()
-
-        msg = MIMEMultipart()
-        msg["From"] = GMAIL_USER
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(GMAIL_USER, GMAIL_PASSWORD)
-            server.sendmail(GMAIL_USER, to_email, msg.as_string())
-
-        log.info(f"Письмо отправлено через Gmail: {to_email} / {subject}")
-        return True
-    except Exception as e:
-        log.error(f"Gmail SMTP ошибка: {e}")
-        return False
+        await call.message.edit_text("❌ Ошибка отправки. Проверь логи Railway.")
 
 
 async def main():

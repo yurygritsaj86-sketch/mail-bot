@@ -2,11 +2,14 @@ import asyncio
 import logging
 import imaplib
 import email
+import smtplib
 import os
 import json
 import tempfile
 import re
 import httpx
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
 
 from aiogram import Bot, Dispatcher, F
@@ -27,8 +30,8 @@ from config import (
     IMAP_CHECK_INTERVAL
 )
 
-MAILERSEND_API_TOKEN = os.getenv("MAILERSEND_API_TOKEN", "")
-MAILERSEND_FROM = os.getenv("MAILERSEND_USER", "")
+GMAIL_USER = os.getenv("GMAIL_USER", "")
+GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -53,7 +56,7 @@ SYSTEM_PROMPT = """Ты — персональный ассистент Гриц
 ОПРЕДЕЛЕНИЕ РОЛИ ОТПРАВИТЕЛЯ
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. ЗАКАЗЧИК — если email содержит домен @polymetal.ru, @areal.ru или @p-krsk.ru НЕ входит в список своих, либо отправитель явно представляет заказчика в тексте письма.
+1. ЗАКАЗЧИК — если email содержит домен @polymetal.ru, @areal.ru или отправитель явно представляет заказчика в тексте письма.
 
 2. ДИРЕКТОР (выше по иерархии) — если отправитель один из:
    - Устинова Ирина Александровна
@@ -79,7 +82,6 @@ SYSTEM_PROMPT = """Ты — персональный ассистент Гриц
 - Деловой, уверенный, партнёрский тон
 - Защищай интересы Исполнителя — не допускай незафиксированных обязательств
 - Не соглашайся на доп. объём без фиксации стоимости и сроков
-- Не используй формулировки ухудшающие позицию Исполнителя
 - Вежливо но твёрдо
 
 ДИРЕКТОР (выше по иерархии):
@@ -90,7 +92,7 @@ SYSTEM_PROMPT = """Ты — персональный ассистент Гриц
 
 РАВНЫЙ КОЛЛЕГА:
 - Неформально, по делу
-- Можно без официоза, живо
+- Живо, без официоза
 - Обращение по имени-отчеству
 - Тон дружеский но профессиональный
 
@@ -104,26 +106,22 @@ SYSTEM_PROMPT = """Ты — персональный ассистент Гриц
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ОБЩИЕ ПРАВИЛА НАПИСАНИЯ
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Никакого канцелярита: не «в соответствии с вышеизложенным», не «прошу принять к сведению»
-- Живые обороты: «посмотрел — вижу такую картину», «давайте разберёмся», «со своей стороны сделаю вот что»
+- Никакого канцелярита
+- Живые обороты: «посмотрел — вижу такую картину», «давайте разберёмся»
 - Всегда по имени-отчеству в начале письма
-- Письмо должно читаться как написанное живым человеком — никаких маркированных списков в тексте ответа, только живые абзацы
-- Если ситуация требует уточнений — задай их прямо и коротко
+- Письмо должно читаться как написанное живым человеком
+- Никаких маркированных списков в тексте ответа — только живые абзацы
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-СТРУКТУРА ТВОЕГО ОТВЕТА
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Верни строго JSON без markdown и преамбулы:
+ВАЖНО: Ответ верни строго в формате JSON (без markdown, без преамбулы):
 {
   "role": "заказчик / директор / равный коллега / подчинённый",
   "summary": "Суть запроса в 1-2 предложениях",
   "risks": "Риски для Исполнителя если применимо, иначе пустая строка",
   "position": "Рекомендованная позиция Юрия",
   "fix_in_writing": "Что нужно зафиксировать письменно если применимо, иначе пустая строка",
-  "variant_1": "Первый вариант ответа — мягкий или нейтральный тон",
-  "variant_2": "Второй вариант ответа — более прямой или жёсткий тон",
-  "variant_3": "Третий вариант ответа — альтернативная позиция или акцент"
+  "variant_1": "Первый вариант ответа",
+  "variant_2": "Второй вариант ответа",
+  "variant_3": "Третий вариант ответа"
 }"""
 
 
@@ -439,7 +437,6 @@ async def generate_and_show_variants(message: Message, state: FSMContext, email_
     analysis_parts = [f"{role_emoji} <b>Роль:</b> {clean_html(role)}"]
     analysis_parts.append(f"🔍 <b>Суть:</b> {clean_html(result.get('summary', '—'))}")
     analysis_parts.append(f"📌 <b>Позиция:</b> {clean_html(result.get('position', '—'))}")
-
     if result.get("risks"):
         analysis_parts.append(f"⚠️ <b>Риски:</b> {clean_html(result.get('risks', ''))}")
     if result.get("fix_in_writing"):
@@ -532,7 +529,7 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
     reply_text = data.get("selected_reply", "")
     em = pending_emails.get(email_key, {})
 
-    success = await send_email(
+    success = send_email(
         to=em.get("reply_to", ""),
         subject=f"Re: {em.get('subject', '')}",
         body=reply_text,
@@ -549,41 +546,27 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-async def send_email(to: str, subject: str, body: str) -> bool:
+def send_email(to: str, subject: str, body: str) -> bool:
     try:
         match = re.search(r'<(.+?)>', to)
         to_email = match.group(1) if match else to.strip()
 
-        payload = {
-            "from": {
-                "email": MAILERSEND_FROM,
-                "name": "Почтовый ассистент"
-            },
-            "to": [{"email": to_email}],
-            "subject": subject,
-            "text": body,
-        }
+        msg = MIMEMultipart()
+        msg["From"] = GMAIL_USER
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.mailersend.com/v1/email",
-                headers={
-                    "Authorization": f"Bearer {MAILERSEND_API_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=30,
-            )
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(GMAIL_USER, GMAIL_PASSWORD)
+            server.sendmail(GMAIL_USER, to_email, msg.as_string())
 
-        if response.status_code in (200, 202):
-            log.info(f"Письмо отправлено: {to_email} / {subject}")
-            return True
-        else:
-            log.error(f"Mailersend ошибка: {response.status_code} {response.text}")
-            return False
-
+        log.info(f"Письмо отправлено через Gmail: {to_email} / {subject}")
+        return True
     except Exception as e:
-        log.error(f"Ошибка отправки: {e}")
+        log.error(f"Gmail SMTP ошибка: {e}")
         return False
 
 

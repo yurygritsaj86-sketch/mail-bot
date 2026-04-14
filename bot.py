@@ -147,6 +147,20 @@ def sender_allowed(from_field: str) -> bool:
     return any(domain in from_lower for domain in ALLOWED_DOMAINS)
 
 
+def mark_as_read(folder: str, uid: str):
+    """Помечает письмо как прочитанное в IMAP."""
+    try:
+        imap = imaplib.IMAP4_SSL("imap.yandex.ru")
+        imap.login(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
+        encoded_folder = encode_folder_utf7(folder)
+        imap.select(f'"{encoded_folder}"')
+        imap.store(uid, '+FLAGS', '\\Seen')
+        imap.logout()
+        log.info(f"Письмо {uid} в папке {folder} помечено как прочитанное")
+    except Exception as e:
+        log.error(f"Ошибка пометки письма как прочитанного: {e}")
+
+
 async def check_mail():
     seen_ids: set[str] = set()
 
@@ -196,6 +210,7 @@ async def check_mail():
                             "body": body,
                             "reply_to": reply_to,
                             "folder": folder,
+                            "uid": uid_str,
                         }
 
                         await notify_user(global_id)
@@ -439,6 +454,8 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
 
     if success:
         await call.message.edit_text("✅ Письмо отправлено!")
+        # Помечаем письмо как прочитанное в IMAP
+        mark_as_read(em.get("folder", "INBOX"), em.get("uid", ""))
         pending_emails.pop(email_key, None)
         await state.clear()
     else:
@@ -449,7 +466,6 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
 
 async def send_email(to: str, subject: str, body: str) -> bool:
     try:
-        # Извлекаем чистый email из поля "Имя <email>"
         match = re.search(r'<(.+?)>', to)
         to_email = match.group(1) if match else to.strip()
 
@@ -475,10 +491,10 @@ async def send_email(to: str, subject: str, body: str) -> bool:
             )
 
         if response.status_code in (200, 202):
-            log.info(f"Письмо отправлено через API: {to_email} / {subject}")
+            log.info(f"Письмо отправлено: {to_email} / {subject}")
             return True
         else:
-            log.error(f"Mailersend API ошибка: {response.status_code} {response.text}")
+            log.error(f"Mailersend ошибка: {response.status_code} {response.text}")
             return False
 
     except Exception as e:

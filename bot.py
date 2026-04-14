@@ -7,6 +7,7 @@ import os
 import json
 import tempfile
 import re
+import httpx
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
@@ -29,8 +30,8 @@ from config import (
     IMAP_CHECK_INTERVAL
 )
 
-MAILERSEND_USER = os.getenv("MAILERSEND_USER", "")
-MAILERSEND_PASS = os.getenv("MAILERSEND_PASS", "")
+MAILERSEND_API_TOKEN = os.getenv("MAILERSEND_API_TOKEN", "")
+MAILERSEND_FROM = os.getenv("MAILERSEND_USER", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -430,7 +431,7 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
     reply_text = data.get("selected_reply", "")
     em = pending_emails.get(email_key, {})
 
-    success = send_email(
+    success = await send_email(
         to=em.get("reply_to", ""),
         subject=f"Re: {em.get('subject', '')}",
         body=reply_text,
@@ -441,29 +442,47 @@ async def confirm_send(call: CallbackQuery, state: FSMContext):
         pending_emails.pop(email_key, None)
         await state.clear()
     else:
-        await call.message.answer("❌ Ошибка отправки. Проверьте настройки SMTP.")
+        await call.message.answer("❌ Ошибка отправки.")
 
     await call.answer()
 
 
-def send_email(to: str, subject: str, body: str) -> bool:
+async def send_email(to: str, subject: str, body: str) -> bool:
     try:
-        msg = MIMEMultipart()
-        msg["From"] = YANDEX_EMAIL
-        msg["To"] = to
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        # Извлекаем чистый email из поля "Имя <email>"
+        match = re.search(r'<(.+?)>', to)
+        to_email = match.group(1) if match else to.strip()
 
-        with smtplib.SMTP("smtp.mailersend.net", 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(MAILERSEND_USER, MAILERSEND_PASS)
-            server.sendmail(YANDEX_EMAIL, to, msg.as_string())
+        payload = {
+            "from": {
+                "email": MAILERSEND_FROM,
+                "name": "Почтовый ассистент"
+            },
+            "to": [{"email": to_email}],
+            "subject": subject,
+            "text": body,
+        }
 
-        log.info(f"Письмо отправлено: {to} / {subject}")
-        return True
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.mailersend.com/v1/email",
+                headers={
+                    "Authorization": f"Bearer {MAILERSEND_API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=30,
+            )
+
+        if response.status_code in (200, 202):
+            log.info(f"Письмо отправлено через API: {to_email} / {subject}")
+            return True
+        else:
+            log.error(f"Mailersend API ошибка: {response.status_code} {response.text}")
+            return False
+
     except Exception as e:
-        log.error(f"SMTP error: {e}")
+        log.error(f"Ошибка отправки: {e}")
         return False
 
 

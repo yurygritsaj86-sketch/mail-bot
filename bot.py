@@ -224,13 +224,19 @@ def send_email(to: str, subject: str, body: str) -> bool:
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        # OAuth2 строка аутентификации для Яндекса
+        # OAuth2 XOAUTH2 строка для Яндекса
         auth_string = f"user={YANDEX_EMAIL}\x01auth=Bearer {YANDEX_OAUTH_TOKEN}\x01\x01"
         auth_b64 = base64.b64encode(auth_string.encode()).decode()
 
-        with smtplib.SMTP_SSL("smtp.yandex.ru", 465) as server:
+        # Используем порт 587 с STARTTLS
+        with smtplib.SMTP("smtp.yandex.ru", 587) as server:
             server.ehlo()
-            server.docmd("AUTH", "XOAUTH2 " + auth_b64)
+            server.starttls()
+            server.ehlo()
+            code, resp = server.docmd("AUTH", "XOAUTH2 " + auth_b64)
+            if code != 235:
+                log.error(f"OAuth аутентификация не прошла: {code} {resp}")
+                return False
             server.sendmail(YANDEX_EMAIL, to_email, msg.as_string())
 
         log.info(f"Письмо отправлено через Яндекс OAuth: {to_email} / {subject}")
